@@ -43,3 +43,17 @@ pub mod test_helpers {
     pub use super::meta_mcp::{CacheKeyDeriver, stable_tool_order, tool_schema_fingerprint};
     pub use super::router::{AppState, create_router};
 }
+
+/// Public embedding API for hosts that want to mount only the MCP protocol
+/// surface inside their own axum/tower application.
+///
+/// This is intentionally a narrow surface — no authentication middleware,
+/// no gateway-management routes, no web UI, no metrics endpoint. The host
+/// composes their own auth, observability, and tower layers around the
+/// returned [`mcp_protocol_router`].
+///
+/// See `README.HIVEWORKS.md` for the design rationale.
+pub mod embed {
+    pub use super::meta_mcp::MetaMcp;
+    pub use super::router::{AppState, mcp_protocol_router};
+}

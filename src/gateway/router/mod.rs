@@ -159,3 +159,49 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 
     app
 }
+
+/// Build a router that exposes **only** the MCP protocol surface
+/// (`POST /mcp`, `GET /mcp`, `DELETE /mcp`, `POST /mcp/{name}`,
+/// `POST /mcp/{name}/{*path}`) and nothing else.
+///
+/// In contrast to [`create_router`], this constructor:
+///
+/// - applies **no** authentication middleware (`auth_middleware`,
+///   `agent_auth_middleware`); the caller is expected to wrap the returned
+///   `Router` with their own auth/authorization stack;
+/// - omits gateway-management routes (`/health`, `/api/costs`, `/sse`),
+///   the JWKS endpoint, key-server routes, the web UI, and `/metrics`;
+/// - applies **no** tower layers (compression, panic catching, tracing);
+///   the caller is expected to compose their own layer stack.
+///
+/// This is the public embedding API: mount the returned router under a
+/// host axum application (typically via `Router::nest("/mcp", ...)`),
+/// add the caller's middleware, and nothing from this crate's
+/// standalone-gateway concerns leaks into the host's URL space.
+///
+/// State note: this constructor reuses the existing [`AppState`] so the
+/// embedder shares one state value with whatever else they build on top
+/// of this crate. The MCP protocol handlers only read a subset of
+/// `AppState`'s fields (`backends`, `meta_mcp`, `meta_mcp_enabled`,
+/// `multiplexer`, `proxy_manager`, `streaming_config`, `tool_policy`,
+/// `mtls_policy`, `sanitize_input`, `ssrf_protection`, `inflight`,
+/// `agent_identity_config`, and `firewall` when that feature is on); a
+/// follow-up commit will split `AppState` into composable parts so an
+/// embedder need not construct the auth/web-ui/key-server fields they
+/// don't use.
+#[allow(clippy::needless_pass_by_value)]
+pub fn mcp_protocol_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route(
+            "/mcp",
+            post(handlers::meta_mcp_handler)
+                .get(handlers::mcp_sse_handler)
+                .delete(handlers::mcp_delete_handler),
+        )
+        .route("/mcp/{name}", post(backend_handlers::backend_handler))
+        .route(
+            "/mcp/{name}/{*path}",
+            post(backend_handlers::backend_handler),
+        )
+        .with_state(state)
+}

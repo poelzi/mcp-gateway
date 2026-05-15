@@ -79,6 +79,12 @@ pub mod validator;
 
 pub use error::{Error, Result};
 
+/// Public embedding API.
+///
+/// Re-exported from [`gateway::embed`] for ergonomic access:
+/// `use mcp_gateway::embed::{mcp_protocol_router, AppState};`.
+pub use gateway::embed;
+
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// MCP Protocol version supported by this gateway (latest)
