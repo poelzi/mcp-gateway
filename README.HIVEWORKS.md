@@ -90,9 +90,9 @@ We will offer items 1, 2, 3, and 6 to upstream as PRs once the detangle stabiliz
 
 | # | Status | Notes |
 | --- | --- | --- |
-| 1 | in progress | This branch's first feature commit. |
-| 2 | pending | After (1) lands and is exercised from hiveworks. |
-| 3 | pending | Larger refactor; sequenced after (2). |
+| 1 | partial — bare router + middleware-composition helpers landed | `mcp_protocol_router()` shipped (commit `5944e63`); `with_auth` / `with_agent_auth` Router-decorator helpers and a `check_agent_scope_and_audit` re-export shipped under `mcp_gateway::embed` (commit-2). A `tower::Layer` constructor pair (`embed::layer::*`) was prototyped but dropped: axum's `FromFnLayer<F, S, T>` parameterizes on the `async fn` item type `F` which is unnameable, so an `impl Layer<S>` return cannot uniquely determine the phantom marker `T`. Embedders who need `ServiceBuilder`-style composition call `axum::middleware::from_fn_with_state` directly with the re-exported middleware functions (documented in `embed`'s rustdoc Pattern C). |
+| 2 | pending | After (1) is exercised from hiveworks; promotes `AppState` construction into a documented builder. |
+| 3 | pending | Larger refactor; sequenced after (2). Splits `AppState` so embedders never see EE-licensed `KeyServer` in their type graph. |
 | 4 | pending | Optional — only if downstream needs passthrough-only mode. |
 | 5 | pending | Legal gate for commercial shipping. |
 | 6 | pending | Required before declaring the fork merge-ready. |
