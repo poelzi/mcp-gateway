@@ -117,6 +117,8 @@
 //! determine the phantom marker `T`. Calling `from_fn_with_state` at the
 //! `.layer()` site (as above) is the workable pattern.
 
+use std::sync::Arc;
+
 use axum::{Router, middleware};
 
 // Re-exports — single discoverable surface for embedders. All items below
@@ -129,6 +131,156 @@ pub use super::oauth::{
     check_agent_scope_and_audit,
 };
 pub use super::router::{AppState, mcp_protocol_router};
+
+// Imports needed by the slim McpState below. These types are all MIT-licensed
+// at their definition sites except `AgentIdentityConfig` (PolyForm-EE); the
+// slim path tolerates the EE type because constructing it via `Default` flips
+// it to `enabled: false`, which makes `validate_agent_identity` a no-op.
+use super::proxy::ProxyManager;
+use super::streaming::NotificationMultiplexer;
+use crate::backend::BackendRegistry;
+use crate::config::{AgentIdentityConfig, AuthConfig, StreamingConfig};
+use crate::mtls::MtlsPolicy;
+use crate::security::ToolPolicy;
+
+/// Slim state for embedded MCP usage. Holds only the fields the MCP protocol
+/// handlers (`/mcp`, `/mcp/{name}`, `/mcp/{name}/{*path}`) actually read at
+/// runtime — the upstream gateway-binary's auth/key-server/JWKS/web-UI/
+/// agent-JWT fields are omitted because the embedded path does not mount
+/// those routes.
+///
+/// # Field-by-field rationale
+///
+/// **Required for handler runtime path** (all MIT):
+/// - `backends` — the federated MCP server registry; core to every dispatch.
+/// - `meta_mcp`, `meta_mcp_enabled` — Meta-MCP tool consolidation; required
+///   even if a host disables consolidation (`meta_mcp_enabled = false`)
+///   because the per-backend handler still reads `state.meta_mcp` for some
+///   bookkeeping.
+/// - `multiplexer` — notification fan-out for streaming responses.
+/// - `proxy_manager` — server→client capability forwarding.
+/// - `streaming_config` — streaming timeouts, buffer sizes, etc.
+/// - `tool_policy`, `mtls_policy` — per-tool authorization.
+/// - `sanitize_input`, `ssrf_protection` — boolean toggles.
+/// - `inflight` — graceful-drain semaphore.
+///
+/// **PolyForm-EE linkage tolerated** (still required by handlers):
+/// - `agent_identity_config` — type is PolyForm-EE; default-constructed
+///   value (`enabled: false`) makes `validate_agent_identity` a no-op.
+///   The type is statically linked but not invoked.
+///
+/// # Construction
+///
+/// Build by struct literal — the host has full control over each field.
+/// A future commit will add a builder with sensible defaults for the
+/// `MetaMcp` / `NotificationMultiplexer` / `StreamingConfig` /
+/// `ToolPolicy` / `MtlsPolicy` constructors (see README.HIVEWORKS.md
+/// objective #2 status).
+///
+/// # Conversion to upstream `AppState`
+///
+/// [`McpState::into_app_state`] produces the full upstream `AppState` by
+/// filling inert defaults for the dead-weight fields. Use it directly when
+/// you need to call upstream APIs that take `AppState`, or call
+/// [`mcp_protocol_router_slim`] which does the conversion for you.
+pub struct McpState {
+    /// Federated MCP server registry.
+    pub backends: Arc<BackendRegistry>,
+    /// Meta-MCP tool aggregator. Always required; toggle aggregation via
+    /// `meta_mcp_enabled`.
+    pub meta_mcp: Arc<MetaMcp>,
+    /// Whether the consolidated `/mcp` POST endpoint exposes Meta-MCP tools.
+    /// When `false`, the `/mcp` POST passes through to a default backend.
+    pub meta_mcp_enabled: bool,
+    /// Notification multiplexer for SSE / streamable-HTTP responses.
+    pub multiplexer: Arc<NotificationMultiplexer>,
+    /// Proxy manager for server-to-client capability forwarding.
+    pub proxy_manager: Arc<ProxyManager>,
+    /// Streaming configuration (timeouts, buffer sizes).
+    pub streaming_config: StreamingConfig,
+    /// Tool access policy.
+    pub tool_policy: Arc<ToolPolicy>,
+    /// mTLS-based tool access policy.
+    pub mtls_policy: Arc<MtlsPolicy>,
+    /// Whether input sanitization runs on tool arguments.
+    pub sanitize_input: bool,
+    /// Whether SSRF protection runs on outbound URLs.
+    pub ssrf_protection: bool,
+    /// In-flight request tracker for graceful drain.
+    pub inflight: Arc<tokio::sync::Semaphore>,
+    /// Per-agent identity configuration. PolyForm-EE type; default-construct
+    /// (`AgentIdentityConfig::default()` => `enabled: false`) to keep the
+    /// path on MIT code only.
+    pub agent_identity_config: AgentIdentityConfig,
+}
+
+impl McpState {
+    /// Convert this slim state into the upstream [`AppState`], filling
+    /// inert defaults for the auth / key-server / agent-auth / JWKS /
+    /// web-UI / firewall fields that the MCP protocol handlers never read.
+    ///
+    /// Concretely, the dead-weight fields are set as:
+    /// - `auth_config = ResolvedAuthConfig::from_config(&AuthConfig::default())`
+    ///   — `enabled: false`, no api keys, no public-path bypass beyond
+    ///   `/health` (which isn't mounted by the embedded router anyway).
+    /// - `key_server = None` — JWKS not exposed.
+    /// - `agent_auth = AgentAuthState::new(false, Arc::new(AgentRegistry::new()))`
+    ///   — agent-JWT validation disabled.
+    /// - `gateway_key_pair = Arc::new(GatewayKeyPair::generate())` — fresh
+    ///   EC P-256 keypair generated at conversion time. Statically linked
+    ///   but never invoked by the MCP protocol handlers.
+    /// - `capability_dirs = vec![]`, `config_path = None` — web UI / API-
+    ///   driven-config concerns; both empty.
+    /// - `firewall = None` (when the `firewall` feature is on) — PolyForm-EE.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`GatewayKeyPair::generate`] fails, which only happens if
+    /// the OS RNG is unavailable — effectively never on any production system.
+    #[must_use]
+    pub fn into_app_state(self) -> AppState {
+        AppState {
+            backends: self.backends,
+            meta_mcp: self.meta_mcp,
+            meta_mcp_enabled: self.meta_mcp_enabled,
+            multiplexer: self.multiplexer,
+            proxy_manager: self.proxy_manager,
+            streaming_config: self.streaming_config,
+            auth_config: Arc::new(ResolvedAuthConfig::from_config(&AuthConfig::default())),
+            key_server: None,
+            tool_policy: self.tool_policy,
+            mtls_policy: self.mtls_policy,
+            sanitize_input: self.sanitize_input,
+            ssrf_protection: self.ssrf_protection,
+            inflight: self.inflight,
+            agent_auth: AgentAuthState::new(false, Arc::new(AgentRegistry::new())),
+            gateway_key_pair: Arc::new(
+                GatewayKeyPair::generate()
+                    .expect("OS RNG should produce a GatewayKeyPair for embedded init"),
+            ),
+            capability_dirs: Vec::new(),
+            config_path: None,
+            #[cfg(feature = "firewall")]
+            firewall: None,
+            agent_identity_config: self.agent_identity_config,
+        }
+    }
+}
+
+/// Build a router with only the MCP protocol surface, from a slim
+/// [`McpState`]. Convenience wrapper around [`mcp_protocol_router`] that
+/// constructs the upstream [`AppState`] internally via
+/// [`McpState::into_app_state`].
+///
+/// Equivalent to:
+///
+/// ```rust,ignore
+/// mcp_protocol_router(Arc::new(state.into_app_state()))
+/// ```
+#[must_use]
+pub fn mcp_protocol_router_slim(state: McpState) -> Router {
+    mcp_protocol_router(Arc::new(state.into_app_state()))
+}
 
 /// Wrap `router` with mcp-gateway's bearer-token / API-key authentication
 /// middleware ([`auth_middleware`]).
@@ -178,10 +330,7 @@ pub fn with_agent_auth<S>(router: Router<S>, state: AgentAuthState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    router.layer(middleware::from_fn_with_state(
-        state,
-        agent_auth_middleware,
-    ))
+    router.layer(middleware::from_fn_with_state(state, agent_auth_middleware))
 }
 
 // Compile-time spike confirming the re-exported middleware functions can be
